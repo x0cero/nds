@@ -59,6 +59,7 @@ pub struct Machine {
     pub keyinput: u16, // 10 bits, active low
     pub extkeyin: u16,
     pub powcnt1: u32,
+    pub exmemcnt: u16,
     // Per-CPU interrupt + display state. Index 0 = ARM9, 1 = ARM7.
     pub ime: [bool; 2],
     pub ie: [u32; 2],
@@ -214,6 +215,7 @@ impl Machine {
             keyinput: 0x3FF,
             extkeyin: 0x7F,
             powcnt1: 0x820F,
+            exmemcnt: 0xE880,
             ime: [false; 2],
             ie: [0; 2],
             if_: [0; 2],
@@ -435,7 +437,11 @@ impl Machine {
                     0x06 => self.aux_wren = true,
                     0x04 => self.aux_wren = false,
                     0x05 => self.auxspi_out = if self.aux_wren { 2 } else { 0 }, // RDSR
-                    0x9F => self.auxspi_out = 0xFF, // JEDEC ID: none (flash carts return FF)
+                    0x9F => {
+                        // JEDEC ID: ST 2Mbit flash (M45PE20), byte-streamed.
+                        self.aux_phase = 3;
+                        self.aux_addr = 0;
+                    }
                     _ => {}
                 }
             }
@@ -446,6 +452,11 @@ impl Machine {
                 if self.aux_addr_n == 3 {
                     self.aux_phase = 2;
                 }
+            }
+            3 => {
+                const ID: [u8; 3] = [0x20, 0x40, 0x13]; // ST M45PE40: 4Mbit, 512KB
+                self.auxspi_out = ID[(self.aux_addr as usize).min(2)];
+                self.aux_addr += 1;
             }
             _ => {
                 let a = (self.aux_addr as usize) & 0x7_FFFF;
@@ -856,6 +867,7 @@ impl View {
             // GXSTAT: geometry engine idle, command FIFO empty + under half.
             0x0600 if cpu == 0 => 0x0000,
             0x0602 if cpu == 0 => 0x0600,
+            0x0204 => m.exmemcnt,
             0x0208 => m.ime[cpu] as u16,
             0x0210 => m.ie[cpu] as u16,
             0x0212 => (m.ie[cpu] >> 16) as u16,
@@ -953,6 +965,14 @@ impl View {
                 }
                 if v & 0x0004 != 0 && old & 0x0004 == 0 && send_empty {
                     m.request_irq(cpu, IRQ_IPC_SEND_EMPTY);
+                }
+            }
+            0x0204 => {
+                if cpu == 0 {
+                    m.exmemcnt = v;
+                } else {
+                    // ARM7 may only touch its own low bits.
+                    m.exmemcnt = (m.exmemcnt & 0xFF80) | (v & 0x007F);
                 }
             }
             0x0208 => m.ime[cpu] = v & 1 != 0,

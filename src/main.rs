@@ -207,6 +207,10 @@ fn main() -> ExitCode {
                 cpu9.regs[15], cpu7.regs[15], d(0), d(1), mm.vramcnt,
                 mm.ie[0], mm.if_[0], mm.ime[0], cpu9.halted, mm.ie[1], mm.if_[1], cpu7.halted
             );
+            eprintln!(
+                "  fifo to7={} to9={} ime7={} cnt7={:#06X}",
+                mm.fifo_to7.len(), mm.fifo_to9.len(), mm.ime[1], mm.ipcfifocnt[1]
+            );
         }
     }
     if trace {

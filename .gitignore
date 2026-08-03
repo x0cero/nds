@@ -1,3 +1,6 @@
 /target
 frame.ppm
 tests/diamond.nds
+/.venv
+ref_frame_*.png
+*.dsv
