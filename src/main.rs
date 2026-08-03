@@ -220,6 +220,10 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                // Geometry FIFO IRQ: empty FIFO satisfies either mode.
+                if mm.gxstat_irq != 0 {
+                    mm.if_[0] |= 1 << 21;
+                }
                 let vblank_now = line == 192;
                 drop(mm);
                 if vblank_now {

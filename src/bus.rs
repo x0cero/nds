@@ -135,6 +135,9 @@ pub struct Machine {
     rtc_data: Vec<u8>,
     rtc_pos: usize,
     rtc_reading: bool,
+    /// GXSTAT IRQ mode (bits 14-15 of the high half): with an always-empty
+    /// geometry FIFO, any enabled mode means the IRQ line is held asserted.
+    pub gxstat_irq: u8,
     /// WiFi register block 0x04800000-0x0480FFFF (ARM7): RAM-backed so init
     /// handshakes read back what they wrote; a few IDs/status special-cased.
     pub wifi: Vec<u8>,
@@ -316,6 +319,7 @@ impl Machine {
             aux_addr_n: 0,
             aux_wren: false,
             save_dirty: false,
+            gxstat_irq: 0,
             wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
             rtc_bit_n: 0,
@@ -937,7 +941,7 @@ impl View {
             0x01AE => u16::from_le_bytes([m.cart_cmd[6], m.cart_cmd[7]]),
             // GXSTAT: geometry engine idle, command FIFO empty + under half.
             0x0600 if cpu == 0 => 0x0000,
-            0x0602 if cpu == 0 => 0x0600,
+            0x0602 if cpu == 0 => 0x0600 | (m.gxstat_irq as u16) << 14,
             0x0204 => m.exmemcnt,
             0x0208 => m.ime[cpu] as u16,
             0x0210 => m.ie[cpu] as u16,
@@ -1037,6 +1041,9 @@ impl View {
                 if v & 0x0004 != 0 && old & 0x0004 == 0 && send_empty {
                     m.request_irq(cpu, IRQ_IPC_SEND_EMPTY);
                 }
+            }
+            0x0602 if cpu == 0 => {
+                m.gxstat_irq = (v >> 14 & 3) as u8;
             }
             0x0204 => {
                 if cpu == 0 {
