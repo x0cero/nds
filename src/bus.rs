@@ -658,37 +658,32 @@ impl Machine {
                 }
             }
             2 => {
-                // Touchscreen controller (TSC2046): 12-bit conversions
-                // streamed MSB-first over the two bytes after the command.
+                // Touchscreen controller (TSC2046). A 12-bit conversion is
+                // read over TWO transfers, MSB first, and the command byte
+                // that starts the NEXT conversion also clocks out the low
+                // byte of the previous one - the SDK sampler relies on that
+                // overlap (write cmd, then loop: write 0 -> high byte,
+                // write cmd -> low byte).
                 if v & 0x80 != 0 {
-                    self.tsc_cmd = v;
-                    self.tsc_byte = 0;
-                    // Calibration points must match user_settings_block():
-                    // ADC (0x02DF,0x032C)->(32,32), (0x0D3B,0x0CE7)->(224,160).
+                    self.spi_out = ((self.tsc_val & 0x1F) << 3) as u8;
                     let chan = v >> 4 & 7;
+                    // Calibration must match user_settings_block():
+                    // ADC (0x02DF,0x032C)->(32,32), (0x0D3B,0x0CE7)->(224,160).
                     self.tsc_val = if !self.touch_down {
-                        if chan == 1 { 0xFFF } else { 0 } // pen up: Y rail-high
+                        0
                     } else {
                         match chan {
-                            5 => (0x02DF + (self.touch_x.saturating_sub(32)) * (0x0D3B - 0x02DF) / 192).min(0xFFF) as u16,
-                            1 => (0x032C + (self.touch_y.saturating_sub(32)) * (0x0CE7 - 0x032C) / 128).min(0xFFF) as u16,
+                            5 => (0x02DF
+                                + self.touch_x.saturating_sub(32) * (0x0D3B - 0x02DF) / 192)
+                                .min(0xFFF) as u16,
+                            1 => (0x032C
+                                + self.touch_y.saturating_sub(32) * (0x0CE7 - 0x032C) / 128)
+                                .min(0xFFF) as u16,
                             _ => 0,
                         }
                     };
-                    if self.io_log.is_some() && self.touch_down {
-                        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                        if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
-                            eprintln!("[t={}] tsc chan={} val={:#05X}", self.now, chan, self.tsc_val);
-                        }
-                    }
-                    self.spi_out = 0;
                 } else {
-                    self.tsc_byte = self.tsc_byte.wrapping_add(1);
-                    self.spi_out = match self.tsc_byte {
-                        1 => (self.tsc_val >> 5) as u8,         // bits 11-5
-                        2 => ((self.tsc_val & 0x1F) << 3) as u8, // bits 4-0
-                        _ => 0,
-                    };
+                    self.spi_out = (self.tsc_val >> 5) as u8;
                 }
             }
             _ => self.spi_out = 0, // power management
