@@ -203,11 +203,27 @@ fn main() -> ExitCode {
             // Mouse on the lower screen = stylus.
             let down = w.get_mouse_down(minifb::MouseButton::Left);
             if let Some((mx, my)) = w.get_mouse_pos(minifb::MouseMode::Discard) {
-                // Mouse comes back in window coords; normalize to buffer
-                // pixels regardless of scale factor / Retina.
+                // minifb's coordinate space differs per platform/scale: on
+                // this setup it's already buffer pixels; elsewhere it can be
+                // window points. If the position fits the buffer, take it
+                // verbatim; otherwise scale by window size.
                 let (ww, wh) = w.get_size();
-                let bx = mx * ppu::WIDTH as f32 / ww.max(1) as f32;
-                let by = my * (ppu::HEIGHT * 2) as f32 / wh.max(1) as f32;
+                let (bx, by) = if mx <= ppu::WIDTH as f32 && my <= (ppu::HEIGHT * 2) as f32 {
+                    (mx, my)
+                } else {
+                    (
+                        mx * ppu::WIDTH as f32 / ww.max(1) as f32,
+                        my * (ppu::HEIGHT * 2) as f32 / wh.max(1) as f32,
+                    )
+                };
+                if down {
+                    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30 == 0 {
+                        eprintln!(
+                            "click: raw=({mx:.0},{my:.0}) win={ww}x{wh} mapped=({bx:.0},{by:.0})"
+                        );
+                    }
+                }
                 if down && by >= ppu::HEIGHT as f32 {
                     mm.touch_x = (bx as u32).min(255);
                     mm.touch_y = (by as u32 - ppu::HEIGHT as u32).min(191);
@@ -312,7 +328,7 @@ fn main() -> ExitCode {
                 u32::from_le_bytes(mm.io2d[0][0..4].try_into().unwrap())
             });
         }
-        if frame % 30 == 0 {
+        if headless && frame % 30 == 0 {
             let mm = m.borrow();
             let d = |e: usize| u32::from_le_bytes(mm.io2d[e][0..4].try_into().unwrap());
             eprintln!(
