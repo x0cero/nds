@@ -141,7 +141,26 @@ fn main() -> ExitCode {
         cpu9.bus.write8(0x027F_FC80 + i as u32, *b);
     }
 
-    let frames: u32 = std::env::var("NDS_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+    // Windowed mode unless NDS_FRAMES (headless test harness) is set.
+    let headless = std::env::var("NDS_FRAMES").is_ok();
+    let mut window = if headless {
+        None
+    } else {
+        let mut w = minifb::Window::new(
+            "NDS",
+            ppu::WIDTH,
+            ppu::HEIGHT * 2,
+            minifb::WindowOptions {
+                scale: minifb::Scale::X2,
+                ..Default::default()
+            },
+        )
+        .expect("window");
+        w.set_target_fps(60);
+        Some(w)
+    };
+
+    let frames: u32 = std::env::var("NDS_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(u32::MAX);
     let script = std::env::var("NDS_INPUT").ok().map(|s| InputScript::parse(&s));
     let mut ppu = Ppu::new();
     let trace = std::env::var("NDS_TRACE").is_ok();
@@ -152,8 +171,29 @@ fn main() -> ExitCode {
     const INSTR9: u32 = 2000;
     const INSTR7: u32 = 500;
 
+    let mut screen: Vec<u32> = vec![0; ppu::WIDTH * ppu::HEIGHT * 2];
     for frame in 0..frames {
-        if let Some(s) = &script {
+        if let Some(w) = &window {
+            if !w.is_open() || w.is_key_down(minifb::Key::Escape) {
+                break;
+            }
+            // Keyboard -> KEYINPUT (active low): arrows, Z=B X=A, A=Y S=X,
+            // Q=L W=R, Enter=Start, RShift=Select.
+            use minifb::Key;
+            let k = |key| !w.is_key_down(key) as u16;
+            let mut mm = m.borrow_mut();
+            mm.keyinput = k(Key::X)
+                | k(Key::Z) << 1
+                | k(Key::RightShift) << 2
+                | k(Key::Enter) << 3
+                | k(Key::Right) << 4
+                | k(Key::Left) << 5
+                | k(Key::Up) << 6
+                | k(Key::Down) << 7
+                | k(Key::W) << 8
+                | k(Key::Q) << 9;
+            mm.extkeyin = 0x7F & !(!k(Key::S) | (!k(Key::A)) << 1); // X/Y buttons
+        } else if let Some(s) = &script {
             m.borrow_mut().keyinput = s.keys_at(frame);
         }
         for line in 0..LINES {
@@ -202,6 +242,11 @@ fn main() -> ExitCode {
             }
         }
         ppu.render_frame(&m.borrow());
+        if let Some(w) = &mut window {
+            screen[..ppu::WIDTH * ppu::HEIGHT].copy_from_slice(&ppu.fb_a);
+            screen[ppu::WIDTH * ppu::HEIGHT..].copy_from_slice(&ppu.fb_b);
+            w.update_with_buffer(&screen, ppu::WIDTH, ppu::HEIGHT * 2).unwrap();
+        }
         if std::env::var("NDS_PALLOG").is_ok() {
             let mm = m.borrow();
             let p0 = u16::from_le_bytes([mm.pal[0], mm.pal[1]]);

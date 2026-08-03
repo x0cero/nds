@@ -21,6 +21,12 @@ pub trait Bus {
     fn note_pc(&mut self, _pc: u32) {}
 }
 
+static WATCH_ADDR: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
+    std::env::var("NDS_WATCH")
+        .ok()
+        .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+});
+
 pub const LCDC_BASE: [u32; 9] = [
     0x0680_0000, // A
     0x0682_0000, // B
@@ -129,6 +135,9 @@ pub struct Machine {
     rtc_data: Vec<u8>,
     rtc_pos: usize,
     rtc_reading: bool,
+    /// WiFi register block 0x04800000-0x0480FFFF (ARM7): RAM-backed so init
+    /// handshakes read back what they wrote; a few IDs/status special-cased.
+    pub wifi: Vec<u8>,
     // HLE BIOS IRQ dispatch stubs.
     pub stub9: [u8; 0x40],
     pub stub7: [u8; 0x40],
@@ -242,6 +251,20 @@ impl Machine {
                 let mut fw = vec![0u8; 0x4_0000];
                 fw[0x08..0x0C].copy_from_slice(b"MACP");
                 fw[0x20..0x22].copy_from_slice(&((0x3FE00u32 / 8) as u16).to_le_bytes());
+                // WiFi calibration block: length at 0x2C, body 0x2C..0x2C+0x138,
+                // CRC16 (init 0) at 0x2A. Pokemon's WM init validates this.
+                fw[0x2C..0x2E].copy_from_slice(&0x0138u16.to_le_bytes());
+                fw[0x36..0x3C].copy_from_slice(&[0x00, 0x09, 0xBF, 0x12, 0x34, 0x56]); // MAC
+                fw[0x3C..0x3E].copy_from_slice(&0x3FFEu16.to_le_bytes()); // enabled channels
+                fw[0x40] = 0xFF; // flags
+                let mut crc: u16 = 0;
+                for i in 0..0x138usize {
+                    crc ^= fw[0x2C + i] as u16;
+                    for _ in 0..8 {
+                        crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+                    }
+                }
+                fw[0x2A..0x2C].copy_from_slice(&crc.to_le_bytes());
                 let us = user_settings_block();
                 fw[0x3FE00..0x3FE00 + us.len()].copy_from_slice(&us);
                 fw
@@ -276,6 +299,7 @@ impl Machine {
             aux_addr_n: 0,
             aux_wren: false,
             save_dirty: false,
+            wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
             rtc_bit_n: 0,
             rtc_byte: 0,
@@ -336,7 +360,8 @@ impl Machine {
     fn cart_start(&mut self, cpu: usize) {
         if self.io_log.is_some() {
             static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 200_000 {
                 eprintln!("cart cmd={:02X?} romctrl={:#010X}", self.cart_cmd, self.romctrl);
             }
         }
@@ -420,6 +445,10 @@ impl Machine {
             }
         }
         v
+    }
+
+    pub fn aux_deselect(&mut self) {
+        self.aux_phase = 0;
     }
 
     /// One byte over AUXSPI to the backup chip (flash-style commands).
@@ -1059,7 +1088,15 @@ impl View {
                     m.timer_acc[cpu][n] = 0;
                 }
             }
-            0x01A0 => m.auxspicnt = v,
+            0x01A0 => {
+                m.auxspicnt = v;
+                // Disabling AUXSPI deselects immediately; a cleared hold bit
+                // only takes effect after the in-flight byte (handled in
+                // auxspi_transfer).
+                if v & 0x8000 == 0 {
+                    m.aux_deselect();
+                }
+            }
             0x01A2 => {
                 if m.auxspicnt & 0x8000 != 0 {
                     m.auxspi_transfer(v as u8);
@@ -1298,6 +1335,17 @@ impl View {
     fn mem_write8(&mut self, a: u32, v: u8) {
         let mut m = self.m.borrow_mut();
         let cpu = self.cpu;
+        if let Some(watch) = *WATCH_ADDR {
+            if a & !3 == watch {
+                static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                    eprintln!(
+                        "watch write {:#010X} <- {:#04X} by cpu{} pc={:#010X}",
+                        a, v, if cpu == 0 { 9 } else { 7 }, m.last_pc[cpu]
+                    );
+                }
+            }
+        }
         if cpu == 0 {
             if a >= m.dtcm_base && a < m.dtcm_base + 0x4000 {
                 let off = (a - m.dtcm_base) as usize;
@@ -1340,12 +1388,38 @@ impl View {
     }
 
     fn is_io(&self, a: u32) -> bool {
-        a >> 24 == 0x04
+        a >> 24 == 0x04 && a & 0x0080_0000 == 0
+    }
+
+    fn is_wifi(&self, a: u32) -> bool {
+        self.cpu == 1 && a >> 24 == 0x04 && a & 0x0080_0000 != 0
+    }
+
+    fn wifi_read16(&mut self, a: u32) -> u16 {
+        let m = self.m.borrow();
+        let off = (a & 0xFFFF) as usize;
+        match off {
+            0x8000 => 0x1440, // W_ID: DS wifi chipset
+            0x815C | 0x815E => 0, // BB busy/read: always ready
+            0x8180 => 0,      // RF busy
+            _ => u16::from_le_bytes([m.wifi[off], m.wifi[off + 1 & 0xFFFF]]),
+        }
+    }
+
+    fn wifi_write16(&mut self, a: u32, v: u16) {
+        let mut m = self.m.borrow_mut();
+        let off = (a & 0xFFFF) as usize;
+        m.wifi[off] = v as u8;
+        m.wifi[(off + 1) & 0xFFFF] = (v >> 8) as u8;
     }
 }
 
 impl Bus for View {
     fn read8(&mut self, a: u32) -> u8 {
+        if self.is_wifi(a) {
+            let v = self.wifi_read16(a & !1);
+            return (v >> ((a & 1) * 8)) as u8;
+        }
         if self.is_io(a) {
             let v = self.io_read16(a & !1);
             (v >> ((a & 1) * 8)) as u8
@@ -1356,7 +1430,9 @@ impl Bus for View {
 
     fn read16(&mut self, a: u32) -> u16 {
         let a = a & !1;
-        if self.is_io(a) {
+        if self.is_wifi(a) {
+            self.wifi_read16(a)
+        } else if self.is_io(a) {
             self.io_read16(a)
         } else {
             u16::from_le_bytes([self.mem_read8(a), self.mem_read8(a + 1)])
@@ -1365,6 +1441,9 @@ impl Bus for View {
 
     fn read32(&mut self, a: u32) -> u32 {
         let a = a & !3;
+        if self.is_wifi(a) {
+            return self.wifi_read16(a) as u32 | (self.wifi_read16(a + 2) as u32) << 16;
+        }
         if self.is_io(a) {
             self.io_read32(a)
         } else {
@@ -1378,6 +1457,12 @@ impl Bus for View {
     }
 
     fn write8(&mut self, a: u32, v: u8) {
+        if self.is_wifi(a) {
+            let cur = self.wifi_read16(a & !1);
+            let nv = if a & 1 == 0 { (cur & 0xFF00) | v as u16 } else { (cur & 0xFF) | (v as u16) << 8 };
+            self.wifi_write16(a & !1, nv);
+            return;
+        }
         if self.is_io(a) {
             // Byte I/O writes: read-modify-write the 16-bit register.
             let cur = self.io_read16(a & !1);
@@ -1394,7 +1479,9 @@ impl Bus for View {
 
     fn write16(&mut self, a: u32, v: u16) {
         let a = a & !1;
-        if self.is_io(a) {
+        if self.is_wifi(a) {
+            self.wifi_write16(a, v);
+        } else if self.is_io(a) {
             self.io_write16(a, v);
             self.dma_service(DMA_IMM);
             self.dma_service(DMA_CART);
@@ -1406,6 +1493,11 @@ impl Bus for View {
 
     fn write32(&mut self, a: u32, v: u32) {
         let a = a & !3;
+        if self.is_wifi(a) {
+            self.wifi_write16(a, v as u16);
+            self.wifi_write16(a + 2, (v >> 16) as u16);
+            return;
+        }
         if self.is_io(a) {
             self.io_write32(a, v);
             self.dma_service(DMA_IMM);
