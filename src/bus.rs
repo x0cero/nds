@@ -424,6 +424,15 @@ impl Machine {
 
     /// One byte over AUXSPI to the backup chip (flash-style commands).
     pub fn auxspi_transfer(&mut self, v: u8) {
+        if self.io_log.is_some() {
+            static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 80 {
+                eprintln!(
+                    "auxspi in={:#04X} phase={} cmd={:#04X} cnt={:#06X} -> out={:#04X}",
+                    v, self.aux_phase, self.aux_cmd, self.auxspicnt, self.auxspi_out
+                );
+            }
+        }
         match self.aux_phase {
             0 => {
                 self.aux_cmd = v;
@@ -436,7 +445,12 @@ impl Machine {
                     }
                     0x06 => self.aux_wren = true,
                     0x04 => self.aux_wren = false,
-                    0x05 => self.auxspi_out = if self.aux_wren { 2 } else { 0 }, // RDSR
+                    0x05 => {
+                        // RDSR: streams the status register on every
+                        // subsequent clocked byte until deselect.
+                        self.auxspi_out = if self.aux_wren { 2 } else { 0 };
+                        self.aux_phase = 4;
+                    }
                     0x9F => {
                         // JEDEC ID: ST 2Mbit flash (M45PE20), byte-streamed.
                         self.aux_phase = 3;
@@ -452,6 +466,9 @@ impl Machine {
                 if self.aux_addr_n == 3 {
                     self.aux_phase = 2;
                 }
+            }
+            4 => {
+                self.auxspi_out = if self.aux_wren { 2 } else { 0 };
             }
             3 => {
                 const ID: [u8; 3] = [0x20, 0x40, 0x13]; // ST M45PE40: 4Mbit, 512KB

@@ -1,5 +1,6 @@
 mod bus;
 mod cpu;
+mod key1;
 mod ppu;
 
 use bus::{Bus, Machine, View, IRQ_VBLANK};
@@ -69,7 +70,16 @@ fn main() -> ExitCode {
         eprintln!("usage: nds <rom.nds>");
         return ExitCode::FAILURE;
     };
-    let rom = std::fs::read(&path).expect("read rom");
+    let mut rom = std::fs::read(&path).expect("read rom");
+    // Clean dumps keep the secure area (2KB at 0x4000) KEY1-encrypted;
+    // hardware decrypts it during boot, so direct boot must too.
+    if rom.len() > 0x4800 {
+        let gamecode = u32::from_le_bytes(rom[0x0C..0x10].try_into().unwrap());
+        if key1::decrypt_secure_area(gamecode, &mut rom[0x4000..0x4800]) {
+            eprintln!("secure area: KEY1-decrypted (encryObj ok)");
+        }
+    }
+    let rom = rom;
     let r32 = |off: usize| u32::from_le_bytes(rom[off..off + 4].try_into().unwrap());
     let arm9_off = r32(0x20) as usize;
     let arm9_entry = r32(0x24);

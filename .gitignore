@@ -4,3 +4,4 @@ tests/diamond.nds
 /.venv
 ref_frame_*.png
 *.dsv
+tests/platinum.nds
