@@ -203,9 +203,14 @@ fn main() -> ExitCode {
             // Mouse on the lower screen = stylus.
             let down = w.get_mouse_down(minifb::MouseButton::Left);
             if let Some((mx, my)) = w.get_mouse_pos(minifb::MouseMode::Discard) {
-                if down && my >= ppu::HEIGHT as f32 {
-                    mm.touch_x = (mx as u32).min(255);
-                    mm.touch_y = (my as u32 - ppu::HEIGHT as u32).min(191);
+                // Mouse comes back in window coords; normalize to buffer
+                // pixels regardless of scale factor / Retina.
+                let (ww, wh) = w.get_size();
+                let bx = mx * ppu::WIDTH as f32 / ww.max(1) as f32;
+                let by = my * (ppu::HEIGHT * 2) as f32 / wh.max(1) as f32;
+                if down && by >= ppu::HEIGHT as f32 {
+                    mm.touch_x = (bx as u32).min(255);
+                    mm.touch_y = (by as u32 - ppu::HEIGHT as u32).min(191);
                     mm.touch_down = true;
                     mm.extkeyin &= !0x40; // pen down (active low)
                 } else {
@@ -216,6 +221,25 @@ fn main() -> ExitCode {
             }
         } else if let Some(s) = &script {
             m.borrow_mut().keyinput = s.keys_at(frame);
+        }
+        // Scripted touch for headless testing: NDS_TOUCH="start-end:x,y[,...]"
+        if let Ok(spec) = std::env::var("NDS_TOUCH") {
+            let mut mm = m.borrow_mut();
+            mm.touch_down = false;
+            mm.extkeyin |= 0x40;
+            for part in spec.split(';') {
+                if let Some((range, xy)) = part.split_once(':') {
+                    if let (Some((a, b)), Some((x, y))) = (range.split_once('-'), xy.split_once(',')) {
+                        let (a, b): (u32, u32) = (a.parse().unwrap_or(0), b.parse().unwrap_or(0));
+                        if frame >= a && frame <= b {
+                            mm.touch_x = x.parse().unwrap_or(0);
+                            mm.touch_y = y.parse().unwrap_or(0);
+                            mm.touch_down = true;
+                            mm.extkeyin &= !0x40;
+                        }
+                    }
+                }
+            }
         }
         for line in 0..LINES {
             {

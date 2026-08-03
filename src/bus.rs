@@ -675,6 +675,12 @@ impl Machine {
                             _ => 0,
                         }
                     };
+                    if self.io_log.is_some() && self.touch_down {
+                        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
+                            eprintln!("[t={}] tsc chan={} val={:#05X}", self.now, chan, self.tsc_val);
+                        }
+                    }
                     self.spi_out = 0;
                 } else {
                     self.tsc_byte = self.tsc_byte.wrapping_add(1);
