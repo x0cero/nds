@@ -29,6 +29,9 @@ pub struct Cpu<B: Bus> {
     spsr_irq: u32,
     spsr_und: u32,
     pub halted: bool,
+    /// Steps to idle (WaitByLoop HLE): real code relies on this delay for
+    /// cross-CPU handshakes, so it must consume scheduler time.
+    spin: u32,
     /// Active IntrWait target mask: re-halts until the BIOS flag word (top of
     /// DTCM / ARM7 WRAM) has one of these bits set by the game's IRQ handler.
     intr_wait: Option<u32>,
@@ -36,6 +39,7 @@ pub struct Cpu<B: Bus> {
     /// Exception vector base: 0xFFFF_0000 on the ARM9 (CP15 high vectors,
     /// the NDS default), 0 on the ARM7.
     vec_base: u32,
+    brk: Option<u32>,
     // CP15 (ARM9 only).
     cp15_control: u32,
     cp15_dtcm: u32,
@@ -65,8 +69,12 @@ impl<B: Bus> Cpu<B> {
             spsr_irq: 0,
             spsr_und: 0,
             halted: false,
+            spin: 0,
             intr_wait: None,
             arm9,
+            brk: std::env::var("NDS_BREAK")
+                .ok()
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
             vec_base: if arm9 { 0xFFFF_0000 } else { 0 },
             cp15_control: 0x0005_2078,
             cp15_dtcm: 0,
@@ -260,6 +268,10 @@ impl<B: Bus> Cpu<B> {
     }
 
     pub fn step(&mut self) {
+        if self.spin > 0 {
+            self.spin -= 1;
+            return;
+        }
         if let Some(mask) = self.intr_wait {
             if self.mode() != 0x12 {
                 let flag_addr = self.bus.bios_flag_addr();
@@ -289,6 +301,15 @@ impl<B: Bus> Cpu<B> {
         }
         if self.halted {
             return;
+        }
+        self.bus.note_pc(self.regs[15]);
+        if self.brk == Some(self.regs[15]) {
+            eprintln!(
+                "BREAK [{}] pc={:#010X} r0={:#010X} r1={:#010X} r2={:#010X} r3={:#010X} lr={:#010X} sp={:#010X}",
+                if self.arm9 { "9" } else { "7" },
+                self.regs[15], self.regs[0], self.regs[1], self.regs[2], self.regs[3],
+                self.regs[14], self.regs[13]
+            );
         }
         if self.thumb() {
             let op = self.bus.read16(self.regs[15]);
@@ -900,13 +921,14 @@ impl<B: Bus> Cpu<B> {
     fn hle_swi(&mut self, n: u32) {
         if std::env::var("NDS_SWILOG").is_ok() {
             eprintln!(
-                "[{}] swi {:#04X} r0={:#010X} r1={:#010X} r2={:#010X}",
+                "[{}] swi {:#04X} r0={:#010X} r1={:#010X} r2={:#010X} lr={:#010X}",
                 if self.arm9 { "9" } else { "7" },
-                n, self.regs[0], self.regs[1], self.regs[2]
+                n, self.regs[0], self.regs[1], self.regs[2], self.regs[14]
             );
         }
         match n {
-            0x03 => { // WaitByLoop: r0 = loop count; instant for us
+            0x03 => { // WaitByLoop: r0 = loop count (4 cycles each); idle for it
+                self.spin = self.regs[0].min(1_000_000);
                 self.regs[0] = 0;
             }
             0x04 => { // IntrWait(discard_old, mask)

@@ -85,8 +85,9 @@ fn main() -> ExitCode {
     );
 
     let m = Rc::new(RefCell::new(Machine::new()));
+    m.borrow_mut().rom = rom.clone();
     let mut cpu9 = Cpu::new(
-        View { m: m.clone(), cpu: 0 },
+        View { m: m.clone(), cpu: 0, in_dma: false },
         true,
         arm9_entry,
         0x0300_2F7C,
@@ -94,7 +95,7 @@ fn main() -> ExitCode {
         0x0300_3FC0,
     );
     let mut cpu7 = Cpu::new(
-        View { m: m.clone(), cpu: 1 },
+        View { m: m.clone(), cpu: 1, in_dma: false },
         false,
         arm7_entry,
         0x0380_FD80,
@@ -115,9 +116,20 @@ fn main() -> ExitCode {
     }
     cpu9.bus.write32(0x027F_F800, 0x0000_1FC2); // chip ID
     cpu9.bus.write32(0x027F_F804, 0x0000_1FC2);
+    cpu9.bus.write32(0x027F_FC00, 0x0000_1FC2); // boot-check copies
+    cpu9.bus.write32(0x027F_FC04, 0x0000_1FC2);
     cpu9.bus.write16(0x027F_F850, 0x5835);
     cpu9.bus.write16(0x027F_FC10, 0x5835);
     cpu9.bus.write32(0x027F_FC40, 1); // boot indicator: cart
+
+    // Firmware user settings copy at 0x027FFC80 (the firmware places this
+    // before booting a game; SDK ARM7 code CRC-checks it and loops forever
+    // on failure). Minimal valid block: version, nickname, touch
+    // calibration, language, CRC16 over the first 0x70 bytes.
+    let us = bus::user_settings_block();
+    for (i, b) in us.iter().enumerate() {
+        cpu9.bus.write8(0x027F_FC80 + i as u32, *b);
+    }
 
     let frames: u32 = std::env::var("NDS_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
     let script = std::env::var("NDS_INPUT").ok().map(|s| InputScript::parse(&s));
@@ -157,32 +169,81 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                let vblank_now = line == 192;
+                drop(mm);
+                if vblank_now {
+                    cpu9.bus.dma_service(bus::DMA_VBLANK);
+                    cpu7.bus.dma_service(bus::DMA_VBLANK);
+                }
             }
-            for _ in 0..INSTR9 {
-                cpu9.step();
-            }
-            for _ in 0..INSTR7 {
-                cpu7.step();
+            m.borrow_mut().tick_timers(2124); // ~33.51MHz / 263 lines / 60Hz
+            // Fine interleave: cross-CPU handshakes assume near-concurrency.
+            for _ in 0..INSTR7 / 8 {
+                for _ in 0..INSTR9 / (INSTR7 / 8) {
+                    cpu9.step();
+                }
+                for _ in 0..8 {
+                    cpu7.step();
+                }
             }
             if trace {
                 *pc_hist.entry(cpu9.regs[15]).or_insert(0u32) += 1;
+                *pc_hist.entry(0xF000_0000 | cpu7.regs[15]).or_insert(0u32) += 1;
             }
         }
         ppu.render_frame(&m.borrow());
+        if std::env::var("NDS_PALLOG").is_ok() {
+            let mm = m.borrow();
+            let p0 = u16::from_le_bytes([mm.pal[0], mm.pal[1]]);
+            eprintln!("pal f{frame}: {:#06X} dispA={:#010X}", p0, {
+                u32::from_le_bytes(mm.io2d[0][0..4].try_into().unwrap())
+            });
+        }
         if frame % 30 == 0 {
             let mm = m.borrow();
             let d = |e: usize| u32::from_le_bytes(mm.io2d[e][0..4].try_into().unwrap());
             eprintln!(
-                "frame {frame}: pc9={:#010X} pc7={:#010X} dispcntA={:#010X} dispcntB={:#010X} vramcnt={:02X?}",
-                cpu9.regs[15], cpu7.regs[15], d(0), d(1), mm.vramcnt
+                "frame {frame}: pc9={:#010X} pc7={:#010X} dispcntA={:#010X} dispcntB={:#010X} vramcnt={:02X?} ie9={:#010X} if9={:#010X} ime9={} h9={} ie7={:#010X} if7={:#010X} h7={}",
+                cpu9.regs[15], cpu7.regs[15], d(0), d(1), mm.vramcnt,
+                mm.ie[0], mm.if_[0], mm.ime[0], cpu9.halted, mm.ie[1], mm.if_[1], cpu7.halted
             );
         }
     }
     if trace {
         let mut v: Vec<_> = pc_hist.into_iter().collect();
         v.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-        for (pc, n) in v.into_iter().take(10) {
-            eprintln!("pc9 {:#010X}: {} line-samples (halted={})", pc, n, cpu9.halted);
+        for (pc, n) in v.into_iter().take(16) {
+            let (cpu, pc) = if pc & 0xF000_0000 == 0xF000_0000 { ("pc7", pc & 0x0FFF_FFFF) } else { ("pc9", pc) };
+            eprintln!("{cpu} {:#010X}: {} line-samples (halted9={} halted7={})", pc, n, cpu9.halted, cpu7.halted);
+        }
+    }
+    if let Ok(spec) = std::env::var("NDS_DUMPMEM") {
+        // "7:addr:len" or "9:addr:len", hex addr/len — dump live memory words.
+        let parts: Vec<&str> = spec.split(':').collect();
+        if parts.len() == 3 {
+            let addr = u32::from_str_radix(parts[1].trim_start_matches("0x"), 16).unwrap();
+            let len = u32::from_str_radix(parts[2].trim_start_matches("0x"), 16).unwrap();
+            for i in (0..len).step_by(4) {
+                let v = if parts[0] == "7" {
+                    cpu7.bus.read32(addr + i)
+                } else {
+                    cpu9.bus.read32(addr + i)
+                };
+                eprintln!("{:#010X}: {:#010X}", addr + i, v);
+            }
+        }
+    }
+    if let Some(log) = m.borrow().io_log.as_ref() {
+        let mut v: Vec<_> = log.iter().collect();
+        v.sort_by_key(|&(_, n)| std::cmp::Reverse(*n));
+        for (&(cpu, off, w), n) in v.into_iter().take(24) {
+            eprintln!(
+                "io {} {:#06X} {}: {}",
+                if cpu == 0 { "arm9" } else { "arm7" },
+                off,
+                if w { "W" } else { "R" },
+                n
+            );
         }
     }
     dump_frame(&ppu, "frame.ppm");
