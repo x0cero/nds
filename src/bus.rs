@@ -144,6 +144,8 @@ pub struct Machine {
     /// (cpu, reg offset, is_write) -> count, populated when NDS_IOLOG is set.
     pub io_log: Option<std::collections::HashMap<(usize, u32, bool), u64>>,
     pub last_pc: [u32; 2],
+    /// Scanline counter since boot, for event timestamps in debug logs.
+    pub now: u64,
 }
 
 /// Firmware user-settings block (0x74 bytes incl. update counter + CRC).
@@ -267,6 +269,21 @@ impl Machine {
                 fw[0x2A..0x2C].copy_from_slice(&crc.to_le_bytes());
                 let us = user_settings_block();
                 fw[0x3FE00..0x3FE00 + us.len()].copy_from_slice(&us);
+                fw[0x3FF00..0x3FF00 + us.len()].copy_from_slice(&us); // backup copy
+                // WFC access-point connection blocks (3 x 0x100 at 0x3FA00):
+                // unconfigured (status 0xFF) but with valid CRC16 over the
+                // first 0xFE bytes - Pokemon re-reads these forever otherwise.
+                for base in [0x3FA00usize, 0x3FB00, 0x3FC00] {
+                    fw[base + 0xE7] = 0xFF; // status: not configured
+                    let mut crc: u16 = 0;
+                    for i in 0..0xFE {
+                        crc ^= fw[base + i] as u16;
+                        for _ in 0..8 {
+                            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+                        }
+                    }
+                    fw[base + 0xFE..base + 0x100].copy_from_slice(&crc.to_le_bytes());
+                }
                 fw
             },
             spi_phase: 0,
@@ -311,6 +328,7 @@ impl Machine {
             stub7: build_stub(0x0381_0000),
             io_log: std::env::var("NDS_IOLOG").ok().map(|_| Default::default()),
             last_pc: [0; 2],
+            now: 0,
         }
     }
 
@@ -362,7 +380,7 @@ impl Machine {
             static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 200_000 {
-                eprintln!("cart cmd={:02X?} romctrl={:#010X}", self.cart_cmd, self.romctrl);
+                eprintln!("[t={}] cart cmd={:02X?} romctrl={:#010X}", self.now, self.cart_cmd, self.romctrl);
             }
         }
         let n = (self.romctrl >> 24 & 7) as usize;
@@ -610,6 +628,13 @@ impl Machine {
                         self.spi_out = 0;
                         if self.spi_addr_n == 3 {
                             self.spi_phase = 2;
+                            if self.io_log.is_some() {
+                                static COUNT: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000 {
+                                    eprintln!("[t={}] fwspi read @{:#08X}", self.now, self.spi_addr);
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -1162,8 +1187,8 @@ impl View {
             if let Some(v) = if enabled { recv.pop_front() } else { recv.front().copied() } {
                 if m.io_log.is_some() {
                     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48 {
-                        eprintln!("fifo {} recvs {:#010X}", cpu, v);
+                    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 500_000 {
+                        eprintln!("[t={}] fifo {} recvs {:#010X}", m.now, cpu, v);
                     }
                 }
                 m.fifo_last[last] = v;
@@ -1212,8 +1237,8 @@ impl View {
                 let cpu = self.cpu;
                 if m.io_log.is_some() {
                     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48 {
-                        eprintln!("fifo {} sends {:#010X} (cnt={:#06X})", cpu, v, m.ipcfifocnt[cpu]);
+                    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 500_000 {
+                        eprintln!("[t={}] fifo {} sends {:#010X}", m.now, cpu, v);
                     }
                 }
                 if m.ipcfifocnt[cpu] & 0x8000 == 0 {

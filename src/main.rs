@@ -199,6 +199,7 @@ fn main() -> ExitCode {
         for line in 0..LINES {
             {
                 let mut mm = m.borrow_mut();
+                mm.now += 1;
                 mm.vcount = line as u16;
                 for cpu in 0..2 {
                     let in_vblank = (192..262).contains(&line);
