@@ -96,6 +96,13 @@ fn main() -> ExitCode {
 
     let m = Rc::new(RefCell::new(Machine::new()));
     m.borrow_mut().rom = rom.clone();
+    // Save file lives next to the ROM.
+    let sav_path = std::path::Path::new(&path).with_extension("sav");
+    if let Ok(sav) = std::fs::read(&sav_path) {
+        let n = sav.len().min(0x8_0000);
+        m.borrow_mut().save[..n].copy_from_slice(&sav[..n]);
+        eprintln!("loaded save: {}", sav_path.display());
+    }
     let mut cpu9 = Cpu::new(
         View { m: m.clone(), cpu: 0, in_dma: false },
         true,
@@ -193,6 +200,20 @@ fn main() -> ExitCode {
                 | k(Key::W) << 8
                 | k(Key::Q) << 9;
             mm.extkeyin = 0x7F & !(!k(Key::S) | (!k(Key::A)) << 1); // X/Y buttons
+            // Mouse on the lower screen = stylus.
+            let down = w.get_mouse_down(minifb::MouseButton::Left);
+            if let Some((mx, my)) = w.get_mouse_pos(minifb::MouseMode::Discard) {
+                if down && my >= ppu::HEIGHT as f32 {
+                    mm.touch_x = (mx as u32).min(255);
+                    mm.touch_y = (my as u32 - ppu::HEIGHT as u32).min(191);
+                    mm.touch_down = true;
+                    mm.extkeyin &= !0x40; // pen down (active low)
+                } else {
+                    mm.touch_down = false;
+                }
+            } else {
+                mm.touch_down = false;
+            }
         } else if let Some(s) = &script {
             m.borrow_mut().keyinput = s.keys_at(frame);
         }
@@ -247,6 +268,14 @@ fn main() -> ExitCode {
             }
         }
         ppu.render_frame(&m.borrow());
+        // Flush dirty save data to disk once per second.
+        if frame % 60 == 59 {
+            let mut mm = m.borrow_mut();
+            if mm.save_dirty {
+                mm.save_dirty = false;
+                let _ = std::fs::write(&sav_path, &mm.save);
+            }
+        }
         if let Some(w) = &mut window {
             screen[..ppu::WIDTH * ppu::HEIGHT].copy_from_slice(&ppu.fb_a);
             screen[ppu::WIDTH * ppu::HEIGHT..].copy_from_slice(&ppu.fb_b);
@@ -271,6 +300,12 @@ fn main() -> ExitCode {
                 "  fifo to7={} to9={} ime7={} cnt7={:#06X}",
                 mm.fifo_to7.len(), mm.fifo_to9.len(), mm.ime[1], mm.ipcfifocnt[1]
             );
+        }
+    }
+    {
+        let mm = m.borrow();
+        if mm.save_dirty || sav_path.exists() {
+            let _ = std::fs::write(&sav_path, &mm.save);
         }
     }
     if trace {

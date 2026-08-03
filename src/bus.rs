@@ -97,6 +97,12 @@ pub struct Machine {
     spi_addr_n: u8,
     tsc_cmd: u8,
     tsc_byte: u8,
+    tsc_val: u16,
+    /// Touchscreen state fed by the frontend (screen coords on the lower
+    /// display; down = pen contact).
+    pub touch_x: u32,
+    pub touch_y: u32,
+    pub touch_down: bool,
     // DMA: [cpu][ch]. cnt holds len (0-20) + CNT_H<<16. src/dst are the
     // internal latches (hardware never writes them back to SAD/DAD).
     pub dma_sad: [[u32; 4]; 2],
@@ -295,6 +301,10 @@ impl Machine {
             spi_addr_n: 0,
             tsc_cmd: 0,
             tsc_byte: 0,
+            tsc_val: 0,
+            touch_x: 0,
+            touch_y: 0,
+            touch_down: false,
             dma_sad: [[0; 4]; 2],
             dma_dad: [[0; 4]; 2],
             dma_cnt: [[0; 4]; 2],
@@ -648,14 +658,31 @@ impl Machine {
                 }
             }
             2 => {
-                // Touchscreen controller: 12-bit conversions, pen up = 0.
+                // Touchscreen controller (TSC2046): 12-bit conversions
+                // streamed MSB-first over the two bytes after the command.
                 if v & 0x80 != 0 {
                     self.tsc_cmd = v;
                     self.tsc_byte = 0;
+                    // Calibration points must match user_settings_block():
+                    // ADC (0x02DF,0x032C)->(32,32), (0x0D3B,0x0CE7)->(224,160).
+                    let chan = v >> 4 & 7;
+                    self.tsc_val = if !self.touch_down {
+                        if chan == 1 { 0xFFF } else { 0 } // pen up: Y rail-high
+                    } else {
+                        match chan {
+                            5 => (0x02DF + (self.touch_x.saturating_sub(32)) * (0x0D3B - 0x02DF) / 192).min(0xFFF) as u16,
+                            1 => (0x032C + (self.touch_y.saturating_sub(32)) * (0x0CE7 - 0x032C) / 128).min(0xFFF) as u16,
+                            _ => 0,
+                        }
+                    };
                     self.spi_out = 0;
                 } else {
-                    self.spi_out = 0;
                     self.tsc_byte = self.tsc_byte.wrapping_add(1);
+                    self.spi_out = match self.tsc_byte {
+                        1 => (self.tsc_val >> 5) as u8,         // bits 11-5
+                        2 => ((self.tsc_val & 0x1F) << 3) as u8, // bits 4-0
+                        _ => 0,
+                    };
                 }
             }
             _ => self.spi_out = 0, // power management
