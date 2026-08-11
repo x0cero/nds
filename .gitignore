@@ -5,3 +5,10 @@ tests/diamond.nds
 ref_frame_*.png
 *.dsv
 tests/platinum.nds
+tests/*.sav
+tests/*.sav.backup-*
+tests/*.mch
+tests/*.ss0
+tests/states/
+overworld.png
+overworld.ppm
