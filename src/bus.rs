@@ -598,7 +598,13 @@ impl Machine {
             0 => {
                 let a = self.cart_addr;
                 let b = |i: usize| *self.rom.get(a + i).unwrap_or(&0xFF);
-                self.cart_addr += 4;
+                // Cart hardware quirk (GBATEK): a B7 transfer that crosses a
+                // 4KB boundary wraps back to the start of the SAME 4KB block
+                // instead of continuing. Platinum's filesystem reads rely on
+                // it; advancing linearly returns wrong bytes for any block
+                // read starting off-alignment (this broke Continue-from-save:
+                // the FS re-read the same table entry forever).
+                self.cart_addr = (a & !0xFFF) | ((a + 4) & 0xFFF);
                 u32::from_le_bytes([b(0), b(1), b(2), b(3)])
             }
             1 => 0x0000_1FC2, // chip ID
