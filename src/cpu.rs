@@ -1,5 +1,15 @@
 use crate::bus::Bus;
 
+/// Env-gated debug switches. Read ONCE: `std::env::var` scans the whole
+/// environment and allocates, which is far too slow for the SWI/decode paths
+/// these guard (they were costing real frame time).
+static SWILOG: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NDS_SWILOG").is_ok());
+static STRICT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NDS_STRICT").is_ok());
+static BREAKSTACK: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NDS_BREAKSTACK").is_ok());
+
 /// CPSR flag bits.
 const N: u32 = 1 << 31;
 const Z: u32 = 1 << 30;
@@ -284,6 +294,29 @@ impl<B: Bus> Cpu<B> {
         self.add_with_flags(a, !b, carry, set)
     }
 
+    /// Execute up to `n` instructions, collapsing idle time.
+    ///
+    /// A halted core with nothing pending, or one spinning out a WaitByLoop,
+    /// has no work for the whole slice, yet `step()` still polls the bus
+    /// (through RefCell) once per call. Platinum's ARM9 sits halted for most
+    /// of every frame, so those polls dominated emulation time: skipping the
+    /// slice wholesale is the single biggest speed win available. The slice
+    /// length is unchanged, so cross-CPU wake latency is exactly as before.
+    pub fn run_slice(&mut self, n: u32) {
+        if self.st.spin >= n {
+            self.st.spin -= n;
+            return;
+        }
+        if self.st.spin == 0 && self.st.halted && !self.bus.irq_pending() {
+            // The IntrWait flag is only ever set by this core's own IRQ
+            // handler, which cannot run while nothing is pending.
+            return;
+        }
+        for _ in 0..n {
+            self.step();
+        }
+    }
+
     pub fn step(&mut self) {
         if self.st.spin > 0 {
             self.st.spin -= 1;
@@ -324,7 +357,7 @@ impl<B: Bus> Cpu<B> {
             // NDS_BREAKSTACK=1 appends the top of the stack, which is how you
             // recover a call chain: the saved link registers sitting there
             // name the callers that the bare lr cannot.
-            let stack = if std::env::var("NDS_BREAKSTACK").is_ok() {
+            let stack = if *BREAKSTACK {
                 let sp = self.st.regs[13];
                 let mut s = String::from(" stack:");
                 for i in 0..10 {
@@ -606,7 +639,7 @@ impl<B: Bus> Cpu<B> {
             self.hle_swi(op >> 16 & 0xFF);
             return;
         }
-        if std::env::var("NDS_STRICT").is_ok() {
+        if *STRICT {
             panic!("unimplemented ARM op {op:#010X} at {:#010X}", self.st.regs[15]);
         }
     }
@@ -949,7 +982,7 @@ impl<B: Bus> Cpu<B> {
     /// High-level emulation of NDS BIOS calls (no BIOS images needed).
     /// SWI numbers follow the NDS BIOS table, which differs from GBA.
     fn hle_swi(&mut self, n: u32) {
-        if std::env::var("NDS_SWILOG").is_ok() {
+        if *SWILOG {
             eprintln!(
                 "[{}] swi {:#04X} r0={:#010X} r1={:#010X} r2={:#010X} lr={:#010X}",
                 if self.st.arm9 { "9" } else { "7" },
@@ -1242,7 +1275,7 @@ impl<B: Bus> Cpu<B> {
                         }
                         self.set_r(13, base);
                     }
-                } else if std::env::var("NDS_STRICT").is_ok() {
+                } else if *STRICT {
                     panic!("unimplemented Thumb op {op:#06X} at {:#010X}", self.st.regs[15]);
                 }
             }
@@ -1312,7 +1345,7 @@ impl<B: Bus> Cpu<B> {
                         self.st.regs[14] = self.st.regs[15].wrapping_add(2) | 1;
                         self.st.regs[15] = lr & !3;
                         self.set_flag(T, false);
-                    } else if std::env::var("NDS_STRICT").is_ok() {
+                    } else if *STRICT {
                         panic!("unimplemented Thumb op {op:#06X} at {:#010X}", self.st.regs[15]);
                     }
                 }

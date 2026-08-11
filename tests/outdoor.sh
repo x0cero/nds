@@ -1,4 +1,8 @@
 #!/bin/sh
+# Pin the clock: the RTC now follows the host by default, and Pokemon
+# tints the overworld by time of day, so replays need a fixed time to stay
+# byte-identical.
+export NDS_RTC="2026-08-02 12:30:00"
 # Replays Pokémon Platinum from boot to standing outdoors in Twinleaf Town
 # (~44300 frames): overworld.sh route, then the rival event in the bedroom,
 # downstairs, mom's two dialogs, and out the front door to the lake edge.

@@ -211,6 +211,12 @@ fn main() -> ExitCode {
     let touch_script = if headless { parse_touch_script() } else { Vec::new() };
     let mut ppu = Ppu::new();
     let trace = std::env::var("NDS_TRACE").is_ok();
+    // NDS_PROF=1: split wall time between CPU execution and frame rendering,
+    // the only two phases big enough to matter for the 60fps budget.
+    let prof = std::env::var("NDS_PROF").is_ok();
+    let (mut t_cpu, mut t_render) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut t_phase = std::time::Instant::now();
+    let (mut fps_frames, mut fps_t) = (0u32, std::time::Instant::now());
     // NDS_MOUSELOG=1: report where each click lands, for diagnosing the
     // window-to-buffer coordinate mapping.
     let mouse_log = std::env::var("NDS_MOUSELOG").is_ok();
@@ -414,6 +420,9 @@ fn main() -> ExitCode {
                 }
             }
         }
+        if prof {
+            t_phase = std::time::Instant::now();
+        }
         for line in 0..LINES {
             {
                 let mut mm = m.borrow_mut();
@@ -452,19 +461,22 @@ fn main() -> ExitCode {
             m.borrow_mut().tick_timers(2124); // ~33.51MHz / 263 lines / 60Hz
             // Fine interleave: cross-CPU handshakes assume near-concurrency.
             for _ in 0..INSTR7 / 8 {
-                for _ in 0..INSTR9 / (INSTR7 / 8) {
-                    cpu9.step();
-                }
-                for _ in 0..8 {
-                    cpu7.step();
-                }
+                cpu9.run_slice(INSTR9 / (INSTR7 / 8));
+                cpu7.run_slice(8);
             }
             if trace {
                 *pc_hist.entry(cpu9.st.regs[15]).or_insert(0u32) += 1;
                 *pc_hist.entry(0xF000_0000 | cpu7.st.regs[15]).or_insert(0u32) += 1;
             }
         }
+        if prof {
+            t_cpu += t_phase.elapsed();
+            t_phase = std::time::Instant::now();
+        }
         ppu.render_frame(&mut m.borrow_mut());
+        if prof {
+            t_render += t_phase.elapsed();
+        }
         // Snapshot point: a frame boundary, after rendering, is the only place
         // the whole machine lives in the structs the savestate covers (the
         // scanline loop above keeps live state in local variables).
@@ -494,6 +506,15 @@ fn main() -> ExitCode {
             screen[..ppu::WIDTH * ppu::HEIGHT].copy_from_slice(upper);
             screen[ppu::WIDTH * ppu::HEIGHT..].copy_from_slice(lower);
             w.update_with_buffer(&screen, ppu::WIDTH, ppu::HEIGHT * 2).unwrap();
+            // Live speed readout: emulated fps (what the game actually gets)
+            // alongside the 60 target, so a slowdown is visible immediately.
+            fps_frames += 1;
+            if fps_t.elapsed() >= std::time::Duration::from_millis(500) {
+                let fps = fps_frames as f64 / fps_t.elapsed().as_secs_f64();
+                w.set_title(&format!("NDS  [{fps:.0}/60]"));
+                fps_frames = 0;
+                fps_t = std::time::Instant::now();
+            }
         }
         // NDS_VIDLOG=1: dump both 2D engines' layer setup, but only when it
         // actually changes, so a long play session leaves a short readable log
@@ -618,6 +639,17 @@ fn main() -> ExitCode {
                 p.attr, p.texparam, p.pltt, p.nverts, s
             );
         }
+    }
+    if prof {
+        let f = last_frame.max(1) as f64;
+        eprintln!(
+            "prof summary: {} frames | cpu {:.1}ms/f | render {:.1}ms/f | total {:.1}ms/f -> {:.0} fps",
+            last_frame,
+            t_cpu.as_secs_f64() * 1000.0 / f,
+            t_render.as_secs_f64() * 1000.0 / f,
+            (t_cpu + t_render).as_secs_f64() * 1000.0 / f,
+            f / (t_cpu + t_render).as_secs_f64()
+        );
     }
     if let Ok(path) = std::env::var("NDS_RAMDUMP") {
         // Write the full 4MB main RAM as raw binary at exit, for offline

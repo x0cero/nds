@@ -1,4 +1,7 @@
 use std::cell::RefCell;
+
+static WIFILOG: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NDS_WIFILOG").is_ok());
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -65,8 +68,12 @@ pub const IRQ_IPC_RECV: u32 = 1 << 18;
 /// Stored as plain binary (not BCD): year 0-99, month, day, weekday, hour,
 /// minute, second. The BCD conversion happens when a register is read.
 static RTC_FIXED: std::sync::LazyLock<[u8; 7]> = std::sync::LazyLock::new(|| {
-    // Default: 2026-08-02 (a Sunday), 12:30:00.
-    let mut d: [u8; 7] = [26, 8, 2, 0, 12, 30, 0];
+    // Default: the host's local time, so Pokemon's day/night tinting matches
+    // what any other emulator (and a real DS) would show. NDS_RTC overrides it
+    // with a fixed start, which is what the test scripts use to keep replays
+    // byte-identical; without the override two runs at different times of day
+    // legitimately render different colours.
+    let mut d: [u8; 7] = host_local_time().unwrap_or([26, 8, 2, 0, 12, 30, 0]);
     let Ok(spec) = std::env::var("NDS_RTC") else { return d };
     let (date, time) = match spec.trim().split_once(' ') {
         Some((a, b)) => (Some(a.trim()), b.trim()),
@@ -101,6 +108,45 @@ static RTC_FIXED: std::sync::LazyLock<[u8; 7]> = std::sync::LazyLock::new(|| {
         d[0], d[1], d[2], d[3], d[4], d[5], d[6]);
     d
 });
+
+/// Host wall-clock time as [year 0-99, month, day, weekday, hour, min, sec].
+/// std can report the epoch but cannot convert to LOCAL time, so this calls
+/// libc's localtime_r directly rather than pulling in a date crate.
+fn host_local_time() -> Option<[u8; 7]> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: i64,
+        zone: *const i8,
+    }
+    unsafe extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(t: *const i64, tm: *mut Tm) -> *mut Tm;
+    }
+    let mut tm = Tm { zone: std::ptr::null(), ..Default::default() };
+    let now = unsafe { time(std::ptr::null_mut()) };
+    if unsafe { localtime_r(&now, &mut tm) }.is_null() {
+        return None;
+    }
+    Some([
+        ((tm.year + 1900) % 100) as u8,
+        (tm.mon + 1) as u8,
+        tm.mday as u8,
+        tm.wday as u8,
+        tm.hour as u8,
+        tm.min as u8,
+        tm.sec as u8,
+    ])
+}
 
 /// Scanlines per emulated second: 263 lines per frame at the DS's 59.8261 Hz.
 const RTC_LINES_PER_SEC: u64 = 15734;
@@ -1873,6 +1919,113 @@ impl View {
 
     /// Byte access to plain memory regions; returns None when the address is
     /// I/O (handled at 16/32-bit granularity) or unmapped.
+    /// Single-borrow word access to the linear RAM regions (TCMs, main RAM,
+    /// shared/ARM7 WRAM), returning None for anything that needs the full
+    /// decode. Every instruction fetch is a 16- or 32-bit read, and the
+    /// byte-at-a-time path pays a RefCell borrow plus the whole address-decode
+    /// match PER BYTE, so this is the hottest path in the emulator: skipping
+    /// it for word accesses is worth more than any other single optimisation.
+    /// Word-aligned accesses never straddle a mirror boundary (every block
+    /// size is a multiple of 4), so a 4-byte slice is always contiguous.
+    /// Bypassed entirely while NDS_WATCH is set, so the watch tool still sees
+    /// every access.
+    #[inline]
+    fn fast_read(&self, a: u32, bytes: usize) -> Option<u32> {
+        if WATCH_ADDR.is_some() {
+            return None;
+        }
+        let m = self.m.borrow();
+        // NDS_IOLOG counts a RAM watch range through the byte path; stay out
+        // of the fast path so those counts stay accurate.
+        if m.io_log.is_some() {
+            return None;
+        }
+        let cpu = self.cpu;
+        let get = |buf: &[u8], off: usize| -> Option<u32> {
+            let s = buf.get(off..off + bytes)?;
+            let mut v = 0u32;
+            for (i, b) in s.iter().enumerate() {
+                v |= (*b as u32) << (i * 8);
+            }
+            Some(v)
+        };
+        if cpu == 0 {
+            if a >= m.dtcm_base && a < m.dtcm_base + 0x4000 {
+                return get(&m.dtcm, (a - m.dtcm_base) as usize);
+            }
+            if a < 0x0200_0000 {
+                return get(&m.itcm, (a & 0x7FFF) as usize);
+            }
+        }
+        match a >> 24 {
+            0x02 => get(&m.main_ram, (a & 0x3F_FFFF) as usize),
+            0x03 => {
+                if cpu == 1 && a >= 0x0380_0000 {
+                    get(&m.wram7, (a & 0xFFFF) as usize)
+                } else {
+                    match m.swram_off(cpu, a) {
+                        Some(off) => get(&m.swram, off),
+                        None if cpu == 1 => get(&m.wram7, (a & 0xFFFF) as usize),
+                        None => None,
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Write counterpart of `fast_read`.
+    #[inline]
+    fn fast_write(&mut self, a: u32, v: u32, bytes: usize) -> bool {
+        if WATCH_ADDR.is_some() {
+            return false;
+        }
+        let mut m = self.m.borrow_mut();
+        if m.io_log.is_some() {
+            return false;
+        }
+        let cpu = self.cpu;
+        let put = |buf: &mut [u8], off: usize| -> bool {
+            let Some(s) = buf.get_mut(off..off + bytes) else { return false };
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = (v >> (i * 8)) as u8;
+            }
+            true
+        };
+        if cpu == 0 {
+            if a >= m.dtcm_base && a < m.dtcm_base + 0x4000 {
+                let off = (a - m.dtcm_base) as usize;
+                return put(&mut m.dtcm, off);
+            }
+            if a < 0x0200_0000 {
+                let off = (a & 0x7FFF) as usize;
+                return put(&mut m.itcm, off);
+            }
+        }
+        match a >> 24 {
+            0x02 => {
+                let off = (a & 0x3F_FFFF) as usize;
+                put(&mut m.main_ram, off)
+            }
+            0x03 => {
+                if cpu == 1 && a >= 0x0380_0000 {
+                    let off = (a & 0xFFFF) as usize;
+                    put(&mut m.wram7, off)
+                } else {
+                    match m.swram_off(cpu, a) {
+                        Some(off) => put(&mut m.swram, off),
+                        None if cpu == 1 => {
+                            let off = (a & 0xFFFF) as usize;
+                            put(&mut m.wram7, off)
+                        }
+                        None => false,
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn mem_read8(&mut self, a: u32) -> u8 {
         if a >> 16 == 0x027F && self.cpu == 1 {
             let mut m = self.m.borrow_mut();
@@ -2052,6 +2205,9 @@ impl Bus for View {
 
     fn read16(&mut self, a: u32) -> u16 {
         let a = a & !1;
+        if let Some(v) = self.fast_read(a, 2) {
+            return v as u16;
+        }
         if self.is_wifi(a) {
             self.wifi_read16(a)
         } else if self.is_io(a) {
@@ -2063,6 +2219,9 @@ impl Bus for View {
 
     fn read32(&mut self, a: u32) -> u32 {
         let a = a & !3;
+        if let Some(v) = self.fast_read(a, 4) {
+            return v;
+        }
         if self.is_wifi(a) {
             return self.wifi_read16(a) as u32 | (self.wifi_read16(a + 2) as u32) << 16;
         }
@@ -2101,6 +2260,9 @@ impl Bus for View {
 
     fn write16(&mut self, a: u32, v: u16) {
         let a = a & !1;
+        if self.fast_write(a, v as u32, 2) {
+            return;
+        }
         if self.is_wifi(a) {
             self.wifi_write16(a, v);
         } else if self.is_io(a) {
@@ -2115,6 +2277,9 @@ impl Bus for View {
 
     fn write32(&mut self, a: u32, v: u32) {
         let a = a & !3;
+        if self.fast_write(a, v, 4) {
+            return;
+        }
         if self.is_wifi(a) {
             self.wifi_write16(a, v as u16);
             self.wifi_write16(a + 2, (v >> 16) as u16);

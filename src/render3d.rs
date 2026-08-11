@@ -8,6 +8,9 @@
 //! POLYGON_ATTR, W- or Z-buffering per the latched SWAP_BUFFERS parameter.
 
 use crate::bus::Machine;
+
+static POLYSTATS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NDS_POLYSTATS").is_ok());
 use crate::ppu::{HEIGHT, WIDTH};
 
 /// NDS_PIXDBG="x,y": log every rasterizer event affecting that pixel.
@@ -164,7 +167,41 @@ fn sample_tex(m: &Machine, tp: u32, pltt: u32, s: f64, t: f64) -> Option<(u16, u
             }
             Some((c & 0x7FFF, 31))
         }
-        5 => Some((0x4210, 31)), // compressed 4x4: TODO, flat gray
+        5 => {
+            // 4x4-texel compressed. Two parallel streams: 2 bits per texel in
+            // 4-byte blocks here, and one 16-bit entry per block in the NEXT
+            // texture slot (slot 1 for a slot-0 texture, slot 3 for slot 2)
+            // giving the block's 4-colour palette offset plus a blend mode for
+            // texel values 2 and 3. This is the DS terrain workhorse: without
+            // it every ground/path polygon draws flat.
+            let bw = tw / 4;
+            let blk = ((y / 4) * bw + x / 4) as u32;
+            let row = m.tex_read8(base + blk * 4 + (y % 4) as u32);
+            let v = (row >> ((x % 4) * 2)) as u32 & 3;
+            let idx_addr =
+                (base & 0x4_0000) + 0x2_0000 + ((base & 0x1_FFFF) >> 1) + blk * 2;
+            let info =
+                m.tex_read8(idx_addr) as u32 | (m.tex_read8(idx_addr + 1) as u32) << 8;
+            let pal = (pltt << 4) + (info & 0x3FFF) * 4;
+            let c = |n: u32| m.texpal_read16(pal + n * 2);
+            // Weighted per-channel blend of two RGB555 colours.
+            let mix = |a: u16, b: u16, wa: u32, wb: u32, d: u32| -> u16 {
+                let ch = |sh: u32| {
+                    ((a as u32 >> sh & 0x1F) * wa + (b as u32 >> sh & 0x1F) * wb) / d & 0x1F
+                };
+                (ch(0) | ch(5) << 5 | ch(10) << 10) as u16
+            };
+            match (info >> 14, v) {
+                (_, 0) => Some((c(0), 31)),
+                (_, 1) => Some((c(1), 31)),
+                (0 | 2, 2) => Some((c(2), 31)),
+                (1, 2) => Some((mix(c(0), c(1), 1, 1, 2), 31)),
+                (3, 2) => Some((mix(c(0), c(1), 5, 3, 8), 31)),
+                (2, 3) => Some((c(3), 31)),
+                (3, 3) => Some((mix(c(0), c(1), 3, 5, 8), 31)),
+                _ => None, // modes 0/1 value 3 = transparent
+            }
+        }
         _ => None,
     }
 }
@@ -280,7 +317,7 @@ pub fn render(m: &Machine) -> Vec<u32> {
     // NDS_POLYSTATS=1: one line per frame summarising the polygon list by
     // mode, texture format and alpha. Answers "what is actually drawing
     // this?" without hunting for a pixel to trace.
-    if std::env::var("NDS_POLYSTATS").is_ok() {
+    if *POLYSTATS {
         let mut modes = [0usize; 4];
         let mut fmts = [0usize; 8];
         let mut translucent = 0usize;

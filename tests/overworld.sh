@@ -1,4 +1,8 @@
 #!/bin/sh
+# Pin the clock: the RTC now follows the host by default, and Pokemon
+# tints the overworld by time of day, so replays need a fixed time to stay
+# byte-identical.
+export NDS_RTC="2026-08-02 12:30:00"
 # Replays Pokémon Platinum from boot to the bedroom overworld (~26400 frames).
 # Derived 2026-08-09. Gotchas: second touch gate resets on A presses (touch-only),
 # Poké Ball center button at (127,92), name typed via A presses then Start->OK.
