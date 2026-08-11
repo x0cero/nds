@@ -619,6 +619,12 @@ fn main() -> ExitCode {
             );
         }
     }
+    if let Ok(path) = std::env::var("NDS_RAMDUMP") {
+        // Write the full 4MB main RAM as raw binary at exit, for offline
+        // pointer hunts / disassembly (address 0x02000000 = file offset 0).
+        std::fs::write(&path, &m.borrow().main_ram).ok();
+        eprintln!("ramdump -> {path}");
+    }
     if let Ok(spec) = std::env::var("NDS_DUMPMEM") {
         // "7:addr:len" or "9:addr:len", hex addr/len — dump live memory words.
         let parts: Vec<&str> = spec.split(':').collect();

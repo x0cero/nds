@@ -268,6 +268,15 @@ pub struct Machine {
     pub last_pc: [u32; 2],
     /// Scanline counter since boot, for event timestamps in debug logs.
     pub now: u64,
+    /// Wi-Fi baseband (BB) register file (0x69 regs). The wireless manager
+    /// writes then reads these back to verify the RF chip during load; a bare
+    /// stub returns 0 and fails the self-test, which is what made Pokémon
+    /// report a "communication error" on Continue. #[serde(skip)]: lazily
+    /// re-seeded, not part of savestates.
+    #[serde(skip)]
+    pub bb: Vec<u8>,
+    #[serde(skip)]
+    pub bb_read: u16,
     /// ARM7 sound register block 0x04000400-0x0400051F, RAM-backed so the
     /// sound driver's status polls read back what it wrote (no audio output).
     /// Kept out of savestates (older state files predate it); re-initialized
@@ -460,6 +469,8 @@ impl Machine {
             gxstat_irq: 0,
             gx: crate::gpu3d::Gpu3d::new(),
             gx_cmds: 0,
+            bb: Vec::new(),
+            bb_read: 0,
             sound: vec![0; 0x120],
             sound_end: vec![0; 16],
             wifi: vec![0; 0x1_0000],
@@ -1370,9 +1381,6 @@ impl View {
         if let Some(log) = m.io_log.as_mut() {
             *log.entry((cpu, off, false)).or_insert(0) += 1;
         }
-        if cpu == 1 && (0x0400..=0x051F).contains(&off) && std::env::var("NDS_SNDLOG").is_ok() {
-            eprintln!("[t={}] snd READ  {:#06X} pc={:#010X}", m.now, off, m.last_pc[1]);
-        }
         match off {
             0x0400..=0x051F if cpu == 1 => m.sound_read16(off),
             0x0004 | 0x0006 => match off {
@@ -1510,9 +1518,6 @@ impl View {
         let off = a & 0xFFFF;
         if let Some(log) = m.io_log.as_mut() {
             *log.entry((cpu, off, true)).or_insert(0) += 1;
-        }
-        if cpu == 1 && (0x0400..=0x051F).contains(&off) && std::env::var("NDS_SNDLOG").is_ok() {
-            eprintln!("[t={}] snd WRITE {:#06X} <- {:#06X} pc={:#010X}", m.now, off, v, m.last_pc[1]);
         }
         match off {
             0x0400..=0x051F if cpu == 1 => m.sound_write16(off, v),
@@ -1993,8 +1998,15 @@ impl View {
         let off = (a & 0xFFFF) as usize;
         match off {
             0x8000 => 0x1440, // W_ID: DS wifi chipset
-            0x815C | 0x815E => 0, // BB busy/read: always ready
-            0x8180 => 0,      // RF busy
+            0x815C => m.bb_read, // W_BB_READ: last baseband register read back
+            0x815E => 0,      // W_BB_BUSY: never busy
+            0x8180 | 0x8184 => 0, // W_RF_BUSY / RF control: ready
+            // Wireless-manager transfer poll: after the driver kicks a command
+            // (0x8001 -> 0x8040) it waits for status 0x803C high byte == 2 and
+            // 0x8214 in {0,9}. With no real wireless engine, report the
+            // transfer as immediately complete so the manager proceeds.
+            0x803C => 0x0200,
+            0x8214 => 0,
             _ => u16::from_le_bytes([m.wifi[off], m.wifi[off + 1 & 0xFFFF]]),
         }
     }
@@ -2004,6 +2016,23 @@ impl View {
         let off = (a & 0xFFFF) as usize;
         m.wifi[off] = v as u8;
         m.wifi[(off + 1) & 0xFFFF] = (v >> 8) as u8;
+        // W_BB_CNT (0x8158): a baseband register access. Bits 0-7 = index,
+        // bits 12-14 = direction (5 = write W_BB_WRITE into the reg, 6 = read
+        // the reg into W_BB_READ). The wireless manager writes a reg then reads
+        // it back to confirm the chip is alive, so the file must remember what
+        // was written. BB[0] is the chip version the driver checks (0x6D).
+        if off == 0x8158 {
+            if m.bb.len() < 0x100 {
+                m.bb = vec![0; 0x100];
+                m.bb[0] = 0x6D;
+            }
+            let idx = (v & 0xFF) as usize;
+            match (v >> 12) & 0xF {
+                5 => m.bb[idx] = m.wifi[0x815A], // W_BB_WRITE low byte
+                6 => m.bb_read = m.bb[idx] as u16,
+                _ => {}
+            }
+        }
     }
 }
 
