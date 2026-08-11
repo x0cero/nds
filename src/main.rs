@@ -512,6 +512,9 @@ fn main() -> ExitCode {
             if fps_t.elapsed() >= std::time::Duration::from_millis(500) {
                 let fps = fps_frames as f64 / fps_t.elapsed().as_secs_f64();
                 w.set_title(&format!("NDS  [{fps:.0}/60]"));
+                if prof {
+                    eprintln!("windowed {fps:.1} fps");
+                }
                 fps_frames = 0;
                 fps_t = std::time::Instant::now();
             }
