@@ -1,10 +1,10 @@
 # nds
 
-[![CI](https://github.com/0arch-io/nds/actions/workflows/ci.yml/badge.svg)](https://github.com/0arch-io/nds/actions/workflows/ci.yml)
+[![CI](https://github.com/x0cero/nds/actions/workflows/ci.yml/badge.svg)](https://github.com/x0cero/nds/actions/workflows/ci.yml)
 
 Nintendo DS emulator written from scratch in Rust. Runs Pokémon Platinum from boot into 3D overworld gameplay, including loading a real save file.
 
-Sibling project to my [Game Boy](https://github.com/0arch-io/gameboy) and [Game Boy Advance](https://github.com/0arch-io/gba) emulators. Same rules: no emulation libraries and no ported reference code. Both ARM cores, the dual-engine 2D video, the 3D geometry engine and rasterizer, the cartridge interface, the touchscreen, and the inter-processor FIFO were each built against hardware documentation (GBATEK, mostly) and debugged one failing behavior at a time. No BIOS or firmware images are required; the BIOS calls games make are implemented in high-level Rust, and the firmware (user settings, Wi-Fi calibration, access-point blocks) is synthesized.
+Sibling project to my [Game Boy](https://github.com/x0cero/gameboy) and [Game Boy Advance](https://github.com/x0cero/gba) emulators. Same rules: no emulation libraries and no ported reference code. Both ARM cores, the dual-engine 2D video, the 3D geometry engine and rasterizer, the cartridge interface, the touchscreen, and the inter-processor FIFO were each built against hardware documentation (GBATEK, mostly) and debugged one failing behavior at a time. No BIOS or firmware images are required; the BIOS calls games make are implemented in high-level Rust, and the firmware (user settings, Wi-Fi calibration, access-point blocks) is synthesized.
 
 ![Pokémon Platinum, player's bedroom rendered by the 3D engine](screenshots/bedroom.png) ![Pokémon Platinum, Twinleaf Town overworld](screenshots/user-twinleaf.png) ![Pokémon Platinum, Lake Verity](screenshots/outdoor.png)
 
