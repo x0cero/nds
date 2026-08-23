@@ -1,7 +1,13 @@
 use std::cell::RefCell;
 
-static WIFILOG: std::sync::LazyLock<bool> =
+/// NDS_WIFILOG=1 traces wireless FRAMES (sent, received, command exchanges),
+/// which is a handful of lines a second and is what a link problem is
+/// diagnosed from. NDS_WIFIREGS=1 adds every single register access, which is
+/// hundreds of thousands of lines and is only for driver-level archaeology.
+pub static WIFILOG: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var("NDS_WIFILOG").is_ok());
+pub static WIFIREGS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("NDS_WIFIREGS").is_ok());
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -314,25 +320,19 @@ pub struct Machine {
     pub last_pc: [u32; 2],
     /// Scanline counter since boot, for event timestamps in debug logs.
     pub now: u64,
-    /// Wi-Fi baseband (BB) register file (0x69 regs). The wireless manager
-    /// writes then reads these back to verify the RF chip during load; a bare
-    /// stub returns 0 and fails the self-test, which is what made Pokémon
-    /// report a "communication error" on Continue. #[serde(skip)]: lazily
-    /// re-seeded, not part of savestates.
+    /// Wireless hardware state that is not part of the register file (the
+    /// microsecond clock, the baseband and RF chips, packets in flight).
+    /// #[serde(skip)] for the same reason as the sound hardware: state files
+    /// written before it existed must still load, and the wireless driver
+    /// re-initialises the whole chip whenever the game uses it.
     #[serde(skip)]
-    pub bb: Vec<u8>,
+    pub wf: crate::wifi::Wifi,
+    /// Sound hardware (ARM7 registers 0x04000400-0x0400051F). Kept out of
+    /// savestates so that state files written before audio existed still load;
+    /// the practical cost is that a restored state starts silent until the
+    /// driver programs its next note, which it does many times a second.
     #[serde(skip)]
-    pub bb_read: u16,
-    /// ARM7 sound register block 0x04000400-0x0400051F, RAM-backed so the
-    /// sound driver's status polls read back what it wrote (no audio output).
-    /// Kept out of savestates (older state files predate it); re-initialized
-    /// lazily, which just means channels read idle right after a restore.
-    #[serde(skip)]
-    pub sound: Vec<u8>,
-    /// Per-channel busy deadline in `now` scanline ticks: one-shot channels
-    /// read SOUNDxCNT bit 31 as set until this passes, then it self-clears.
-    #[serde(skip)]
-    pub sound_end: Vec<u64>,
+    pub spu: crate::spu::Spu,
 }
 
 /// Firmware user-settings block (0x74 bytes incl. update counter + CRC).
@@ -365,6 +365,22 @@ pub fn user_settings_block() -> [u8; 0x74] {
     us
 }
 
+/// Give a synthesized firmware image a different MAC address. The address at
+/// 0x36 sits INSIDE the wireless calibration block (0x2C..0x164), whose CRC16
+/// the wireless driver checks, so the checksum at 0x2A has to be recomputed or
+/// the console decides its radio is misconfigured and never comes up.
+pub fn set_firmware_mac(fw: &mut [u8], mac: [u8; 6]) {
+    fw[0x36..0x3C].copy_from_slice(&mac);
+    let mut crc: u16 = 0;
+    for i in 0..0x138usize {
+        crc ^= fw[0x2C + i] as u16;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xA001 } else { crc >> 1 };
+        }
+    }
+    fw[0x2A..0x2C].copy_from_slice(&crc.to_le_bytes());
+}
+
 /// The BIOS IRQ dispatcher both CPUs get: save regs, load the user handler
 /// pointer from a literal-addressed word, call it, return from exception.
 fn build_stub(handler_ptr_plus4: u32) -> Vec<u8> {
@@ -386,7 +402,7 @@ fn build_stub(handler_ptr_plus4: u32) -> Vec<u8> {
 
 impl Machine {
     pub fn new() -> Self {
-        Self {
+        let mut m = Self {
             rom: Vec::new(),
             io_log: std::env::var("NDS_IOLOG").ok().map(|_| Default::default()),
             main_ram: vec![0; 0x40_0000],
@@ -515,10 +531,8 @@ impl Machine {
             gxstat_irq: 0,
             gx: crate::gpu3d::Gpu3d::new(),
             gx_cmds: 0,
-            bb: Vec::new(),
-            bb_read: 0,
-            sound: vec![0; 0x120],
-            sound_end: vec![0; 16],
+            wf: crate::wifi::Wifi::default(),
+            spu: crate::spu::Spu::default(),
             wifi: vec![0; 0x1_0000],
             rtc_reg: 0,
             rtc_bit_n: 0,
@@ -535,7 +549,9 @@ impl Machine {
             stub7: build_stub(0x0381_0000),
             last_pc: [0; 2],
             now: 0,
-        }
+        };
+        crate::wifi::reset(&mut m);
+        m
     }
 
     /// Advance all timers by `cycles` bus clocks (33MHz domain, both CPUs).
@@ -1121,60 +1137,56 @@ impl Machine {
         None
     }
 
-    /// ARM7 sound block 0x400-0x51F, storage-only (no audio output): registers
-    /// read back what was written so the driver's status polls see a coherent
-    /// channel model. SOUNDxCNT bit 31 (start/busy) self-clears for one-shot
-    /// channels once the sample's play time elapses on the scanline clock
-    /// (~2130 CPU cycles per scanline); loop/manual channels stay busy until
-    /// the CPU clears them. Capture busy bits clear on read.
-    fn sound_ensure(&mut self) {
-        if self.sound.len() < 0x120 {
-            self.sound = vec![0; 0x120];
-        }
-        if self.sound_end.len() < 16 {
-            self.sound_end = vec![0; 16];
+    /// Run the mixer forward. The SPU has to be lifted out of the machine to
+    /// run: it reads the sample data it is playing out of main RAM, and sound
+    /// capture writes back into it, so it needs the machine it lives in.
+    /// `Spu` is plain data, so taking and replacing it is a move, not a copy.
+    pub fn spu_run(&mut self, cycles: u32) {
+        let mut spu = std::mem::take(&mut self.spu);
+        spu.run(self, cycles);
+        self.spu = spu;
+    }
+
+    /// Memory as the SPU sees it. The sound hardware fetches from main RAM and
+    /// WRAM only; it has no path to VRAM, the cartridge or I/O.
+    pub fn spu_read8(&self, a: u32) -> u8 {
+        match a >> 24 {
+            0x02 => self.main_ram[(a & 0x3F_FFFF) as usize],
+            0x03 => match self.swram_off(1, a) {
+                Some(off) => self.swram[off],
+                None => self.wram7[(a & 0xFFFF) as usize],
+            },
+            _ => 0,
         }
     }
 
-    pub fn sound_read16(&mut self, off: u32) -> u16 {
-        self.sound_ensure();
-        let i = (off - 0x400) as usize & !1;
-        let mut v = u16::from_le_bytes([self.sound[i], self.sound[i + 1]]);
-        if off < 0x500 && off & 0xF == 2 {
-            let ch = ((off - 0x400) >> 4) as usize;
-            let repeat = v >> 11 & 3;
-            if v & 0x8000 != 0 && repeat == 2 && self.now >= self.sound_end[ch] {
-                v &= 0x7FFF;
-                self.sound[i + 1] &= 0x7F;
-            }
-        }
-        if off & !1 == 0x508 {
-            // SNDCAP0/1CNT busy bits: capture "completes" immediately.
-            v &= !0x8080;
-            self.sound[i] &= 0x7F;
-            self.sound[i + 1] &= 0x7F;
-        }
-        v
+    pub fn spu_read16(&self, a: u32) -> u16 {
+        u16::from_le_bytes([self.spu_read8(a), self.spu_read8(a + 1)])
     }
 
-    pub fn sound_write16(&mut self, off: u32, v: u16) {
-        self.sound_ensure();
-        let i = (off - 0x400) as usize & !1;
-        self.sound[i] = v as u8;
-        self.sound[i + 1] = (v >> 8) as u8;
-        if off < 0x500 && off & 0xF == 2 && v & 0x8000 != 0 {
-            let ch = ((off - 0x400) >> 4) as usize;
-            let b = ch * 0x10;
-            let tmr = u16::from_le_bytes([self.sound[b + 8], self.sound[b + 9]]) as u64;
-            let pnt = u16::from_le_bytes([self.sound[b + 0xA], self.sound[b + 0xB]]) as u64;
-            let len = u32::from_le_bytes([
-                self.sound[b + 0xC], self.sound[b + 0xD], self.sound[b + 0xE], self.sound[b + 0xF],
-            ]) as u64;
-            // Words -> samples by format: PCM8 x4, PCM16 x2, ADPCM x8.
-            let samples = (pnt + len) * match v >> 13 & 3 { 0 => 4, 1 => 2, 2 => 8, _ => 1 };
-            let cycles = samples.max(1) * (0x1_0000 - tmr).max(1) * 2;
-            self.sound_end[ch] = self.now + (cycles / 2130).max(1);
+    pub fn spu_read32(&self, a: u32) -> u32 {
+        u32::from_le_bytes([
+            self.spu_read8(a),
+            self.spu_read8(a + 1),
+            self.spu_read8(a + 2),
+            self.spu_read8(a + 3),
+        ])
+    }
+
+    pub fn spu_write8(&mut self, a: u32, v: u8) {
+        match a >> 24 {
+            0x02 => self.main_ram[(a & 0x3F_FFFF) as usize] = v,
+            0x03 => match self.swram_off(1, a) {
+                Some(off) => self.swram[off] = v,
+                None => self.wram7[(a & 0xFFFF) as usize] = v,
+            },
+            _ => {}
         }
+    }
+
+    pub fn spu_write16(&mut self, a: u32, v: u16) {
+        self.spu_write8(a, v as u8);
+        self.spu_write8(a + 1, (v >> 8) as u8);
     }
 
     /// Read the 3D texture-image space (4 x 128KB slots): banks A-D with
@@ -1428,7 +1440,7 @@ impl View {
             *log.entry((cpu, off, false)).or_insert(0) += 1;
         }
         match off {
-            0x0400..=0x051F if cpu == 1 => m.sound_read16(off),
+            0x0400..=0x051F if cpu == 1 => m.spu.read16(off),
             0x0004 | 0x0006 => match off {
                 0x0004 => m.dispstat[cpu],
                 _ => m.vcount,
@@ -1566,7 +1578,7 @@ impl View {
             *log.entry((cpu, off, true)).or_insert(0) += 1;
         }
         match off {
-            0x0400..=0x051F if cpu == 1 => m.sound_write16(off, v),
+            0x0400..=0x051F if cpu == 1 => m.spu.write16(off, v),
             0x0004 => {
                 m.dispstat[cpu] = (m.dispstat[cpu] & 0x0047) | (v & !0x0047);
             }
@@ -2147,45 +2159,38 @@ impl View {
     }
 
     fn wifi_read16(&mut self, a: u32) -> u16 {
-        let m = self.m.borrow();
-        let off = (a & 0xFFFF) as usize;
-        match off {
-            0x8000 => 0x1440, // W_ID: DS wifi chipset
-            0x815C => m.bb_read, // W_BB_READ: last baseband register read back
-            0x815E => 0,      // W_BB_BUSY: never busy
-            0x8180 | 0x8184 => 0, // W_RF_BUSY / RF control: ready
-            // Wireless-manager transfer poll: after the driver kicks a command
-            // (0x8001 -> 0x8040) it waits for status 0x803C high byte == 2 and
-            // 0x8214 in {0,9}. With no real wireless engine, report the
-            // transfer as immediately complete so the manager proceeds.
-            0x803C => 0x0200,
-            0x8214 => 0,
-            _ => u16::from_le_bytes([m.wifi[off], m.wifi[off + 1 & 0xFFFF]]),
+        let v = self.wifi_read16_inner(a);
+        if *WIFIREGS {
+            let m = self.m.borrow();
+            eprintln!(
+                "[wifi] {:>8} rd {} = {:04X}  pc={:08X}",
+                m.now,
+                crate::wifi::reg_name(a & 0xFFFF),
+                v,
+                m.last_pc[1]
+            );
         }
+        v
+    }
+
+    fn wifi_read16_inner(&mut self, a: u32) -> u16 {
+        let mut m = self.m.borrow_mut();
+        crate::wifi::read16(&mut m, (a & 0xFFFF) as usize)
     }
 
     fn wifi_write16(&mut self, a: u32, v: u16) {
-        let mut m = self.m.borrow_mut();
-        let off = (a & 0xFFFF) as usize;
-        m.wifi[off] = v as u8;
-        m.wifi[(off + 1) & 0xFFFF] = (v >> 8) as u8;
-        // W_BB_CNT (0x8158): a baseband register access. Bits 0-7 = index,
-        // bits 12-14 = direction (5 = write W_BB_WRITE into the reg, 6 = read
-        // the reg into W_BB_READ). The wireless manager writes a reg then reads
-        // it back to confirm the chip is alive, so the file must remember what
-        // was written. BB[0] is the chip version the driver checks (0x6D).
-        if off == 0x8158 {
-            if m.bb.len() < 0x100 {
-                m.bb = vec![0; 0x100];
-                m.bb[0] = 0x6D;
-            }
-            let idx = (v & 0xFF) as usize;
-            match (v >> 12) & 0xF {
-                5 => m.bb[idx] = m.wifi[0x815A], // W_BB_WRITE low byte
-                6 => m.bb_read = m.bb[idx] as u16,
-                _ => {}
-            }
+        if *WIFIREGS {
+            let m = self.m.borrow();
+            eprintln!(
+                "[wifi] {:>8} wr {} = {:04X}  pc={:08X}",
+                m.now,
+                crate::wifi::reg_name(a & 0xFFFF),
+                v,
+                m.last_pc[1]
+            );
         }
+        let mut m = self.m.borrow_mut();
+        crate::wifi::write16(&mut m, (a & 0xFFFF) as usize, v);
     }
 }
 

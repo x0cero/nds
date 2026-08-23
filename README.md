@@ -20,7 +20,9 @@ The target game is Pokémon Platinum, chosen because it exercises almost everyth
 - Save files persist to `<rom>.sav`, and full-machine savestates make any scene reachable in about a tenth of a second instead of a multi-minute replay.
 - The ARMv5TE core passes the armwrestler test suite; the ARMv4 core is the same one that runs Pokémon FireRed frame-identical to mGBA in the GBA project.
 
-Not done yet, in rough priority order: audio (none at all), compressed 4x4 textures (DS terrain uses them heavily; they render flat gray), toon/highlight shading and shadow volumes, affine and bitmap backgrounds, per-scanline effects (everything latches once per frame), and the real-time clock protocol (Platinum currently thinks it is always night, which is why the outdoor screenshots are moody).
+- Sound: all 16 mixer channels (PCM8, PCM16, IMA-ADPCM, PSG square waves, noise), panning, the master mixer, and sound capture, played through the host's audio device or recorded to a WAV file.
+
+Not done yet, in rough priority order: toon/highlight shading and shadow volumes, affine and bitmap backgrounds, per-scanline effects (everything latches once per frame), and bitmap sprites.
 
 ## How it was debugged
 
@@ -50,7 +52,7 @@ Saves are written to `<rom>.sav` next to the ROM. Savestates: F5 saves, F9 loads
 | L / R | Q / W |
 | Touch screen | Mouse (click and drag on the lower screen) |
 
-Headless scripted runs are also supported for testing: `NDS_FRAMES` runs a fixed number of frames and dumps the final framebuffer, `NDS_INPUT` scripts button presses by frame range, and `NDS_TOUCH` scripts stylus input the same way.
+Headless scripted runs are also supported for testing: `NDS_FRAMES` runs a fixed number of frames and dumps the final framebuffer, `NDS_INPUT` scripts button presses by frame range, and `NDS_TOUCH` scripts stylus input the same way. `NDS_WAV=path` records the sound mixer's output to a WAV file, which is how audio gets checked without anyone having to listen to it.
 
 ## Architecture
 
@@ -59,6 +61,9 @@ Headless scripted runs are also supported for testing: `NDS_FRAMES` runs a fixed
 - `src/ppu.rs`: both 2D engines. Text backgrounds, sprites (regular and affine, OBJ window), extended palettes, windows, blending, master brightness, display capture.
 - `src/gpu3d.rs`: the geometry engine. Command FIFO, matrix stacks in 20.12 fixed point, lighting, the full vertex command set, double-buffered polygon RAM.
 - `src/render3d.rs`: the software rasterizer. Sutherland-Hodgman clipping, perspective-correct half-space rasterization, W/Z buffering, texture sampling for six formats, two-pass translucency.
+- `src/spu.rs`: the sound mixer. Sixteen channels walking their own buffers in main RAM, four sample formats, per-channel volume and panning, and sound capture back into memory.
+- `src/audio.rs`: host output. Resamples the DS's 32728 Hz to whatever the sound card wants, and steers the read rate by how full the buffer is so that an emulator running slightly under full speed drifts in pitch instead of clicking.
+- `src/soundtbl.rs`: the ARM7 BIOS pitch, volume and sine tables the sound driver looks notes up in.
 - `src/state.rs`: full-machine savestates via serde.
 - `src/key1.rs`: the Blowfish variant used for secure-area decryption.
 - `src/main.rs`: the minifb frontend, the direct-boot loader, the scheduler, and the scripted-input test harness.

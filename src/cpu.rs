@@ -1132,6 +1132,21 @@ impl<B: Bus> Cpu<B> {
                     }
                 }
             }
+            // ARM7 sound tables. The NitroSDK driver converts every note's
+            // pitch and volume through these, so returning the index unchanged
+            // (the old behaviour) detunes the music and mangles its levels.
+            0x1A => {
+                let i = self.st.regs[0] as usize;
+                self.st.regs[0] = crate::soundtbl::SINE.get(i).map_or(0, |v| *v as u16 as u32);
+            }
+            0x1B => {
+                let i = self.st.regs[0] as usize;
+                self.st.regs[0] = crate::soundtbl::PITCH.get(i).map_or(0, |v| *v as u32);
+            }
+            0x1C => {
+                let i = self.st.regs[0] as usize;
+                self.st.regs[0] = crate::soundtbl::VOLUME.get(i).map_or(0, |v| *v as u32);
+            }
             _ => {}
         }
     }
