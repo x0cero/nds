@@ -1,6 +1,7 @@
 # nds
 
 [![CI](https://github.com/x0cero/nds/actions/workflows/ci.yml/badge.svg)](https://github.com/x0cero/nds/actions/workflows/ci.yml)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/KMWnFJ5tre)
 
 Nintendo DS emulator written from scratch in Rust. Runs Pokémon Platinum from boot into 3D overworld gameplay, including loading a real save file.
 
